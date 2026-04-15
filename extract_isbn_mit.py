@@ -4,8 +4,8 @@
 再从列表 A 的每个页面提取 ISBN，汇总输出到 txt 文件。
 
 用法:
-  python extract_isbn.py <url> [output.txt]
-  python extract_isbn.py -f urls.txt [output.txt]   # 多个入口 URL
+  python3 extract_isbn_mit.py <url> [output.txt]
+  python3 extract_isbn_mit.py -f urls.txt output.txt   # 多个入口 URL
 """
 
 import re
