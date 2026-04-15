@@ -93,7 +93,7 @@ def extract_isbns(text: str) -> list[str]:
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python extract_isbn.py <input.html> [output.txt]")
+        print("用法: python parseISBNFromHtml.py <input.html> [output.txt]")
         sys.exit(1)
 
     input_path = Path(sys.argv[1])
