@@ -1,0 +1,41 @@
+[project]
+name = "Tools"
+version = "0.1.0"
+description = "工具类工程"
+requires-python = ">=3.13"
+readme = "README.md"
+authors = [
+    { name = "Phil Yen", email = "yan810753014@gmail.com" },
+]
+
+# 运行时依赖（发布到 PyPI 时用户会装这些）
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scipy>=1.12",
+    "matplotlib>=3.8",
+    "requests>=2.31",
+]
+
+
+# ---------- 工具配置（可选但推荐）----------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+]
+ignore = ["E501"]  # line too long (ruff format 会处理)
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
