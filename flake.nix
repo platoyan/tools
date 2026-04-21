@@ -19,17 +19,24 @@
 	      # default 是对于 nix develop
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            python
+            python        # Python 解释器
+            pkgs.uv       # uv 包管理器
           ];
           shellHook = ''
+            # 让 uv 使用 Nix 提供的 Python，而不是自己下载
+            export UV_PYTHON="${python}/bin/python"
+            # 禁止 uv 自动下载 Python（强制用 Nix 的）
+            export UV_PYTHON_DOWNLOADS=never
             # 创建 venv 用于 pip 安装 nixpkgs 没有的包
             if [ ! -d .venv ]; then
               echo "创建 .venv..."
-              ${python}/bin/python -m venv .venv
+              uv venv --python "${python}/bin/python"
             fi
-
+            # 自动同步依赖（根据 pyproject.toml + uv.lock）：保证 venv 和 uv.lock 一致
+            if [ -f pyproject.toml ]; then
+              uv sync --quiet
+            fi
             source .venv/bin/activate
-
             echo "Python $(python --version) | 虚拟环境: $VIRTUAL_ENV"
           '';
         };
