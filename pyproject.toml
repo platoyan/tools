@@ -15,6 +15,10 @@ dependencies = [
     "scipy>=1.12",
     "matplotlib>=3.8",
     "requests>=2.31",
+    "pypdf>=6.10.2",
+    "pdf2image>=1.17.0",
+    "pytesseract>=0.3.13",
+    "pillow>=12.2.0",
 ]
 
 

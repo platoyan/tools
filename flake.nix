@@ -15,12 +15,17 @@
         pkgs = nixpkgs.legacyPackages.${system};
         # 选择 Python 版本：python311 / python312 / python313
         python = pkgs.python313;
+        tesseractWithLangs = pkgs.tesseract.override {
+          enableLanguages = [ "eng" "chi_sim" "chi_tra" "jpn" "jpn_vert" ];
+        };
       in {
 	      # default 是对于 nix develop
         devShells.default = pkgs.mkShell {
           buildInputs = [
             python        # Python 解释器
             pkgs.uv       # uv 包管理器
+            tesseractWithLangs
+            pkgs."poppler-utils"
           ];
           shellHook = ''
             # 让 uv 使用 Nix 提供的 Python，而不是自己下载

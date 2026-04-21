@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
 扫描文件夹下所有 PDF 和 EPUB 文件,提取 ISBN。
+支持文字版 PDF 和扫描版 PDF(自动 OCR 回退)。
 
 用法:
-    python obtainsISBNFromPdfs.py <目录路径> [--output result.csv] [--pages 10]
+    python extract_isbn.py <目录路径> [-t isbns.txt] [-o mapping.csv]
+    python extract_isbn.py <目录路径> --no-ocr          # 禁用 OCR
+    python extract_isbn.py <目录路径> --force-ocr       # 强制所有 PDF 都 OCR
 
-依赖:
-    pip install pypdf ebooklib beautifulsoup4
+Python 依赖:
+    pip install pypdf pdf2image pytesseract pillow
+
+系统依赖(OCR 需要):
+    # macOS(tesseract-lang 一次装齐所有语言):
+    brew install tesseract tesseract-lang poppler
+    # Ubuntu/Debian:
+    sudo apt install tesseract-ocr poppler-utils \\
+        tesseract-ocr-chi-sim tesseract-ocr-chi-tra \\
+        tesseract-ocr-jpn tesseract-ocr-jpn-vert
 """
 
 import argparse
@@ -17,25 +28,31 @@ import zipfile
 from pathlib import Path
 
 
-# ISBN 正则:匹配 ISBN-10 或 ISBN-13,允许中间有连字符/空格
-ISBN_PATTERN = re.compile(
-    r'ISBN(?:[-\s]*1[03])?[:\s]*'           # 可选的 ISBN / ISBN-10 / ISBN-13 前缀
-    r'((?:97[89][-\s]?)?'                   # 可选的 978/979 前缀
-    r'(?:\d[-\s]?){9}[\dXx])',              # 9 位数字 + 校验位 (数字或 X)
+# ISBN-13:13 位数字,中间允许连字符/空格,可选 ISBN 前缀,必须 978/979 开头
+ISBN13_WITH_PREFIX = re.compile(
+    r'ISBN(?:[-\s]*13)?[:\s]*-?\s*'
+    r'(97[89][\d\-\s]{9,16}\d)',       # 978/979 + 10~17 字符(含分隔符) + 末尾数字
+    re.IGNORECASE
+)
+ISBN13_BARE = re.compile(r'(?<![\d])(97[89][\d\-\s]{9,16}\d)(?![\d])')
+
+# ISBN-10:必须有 ISBN 前缀,避免跟其他 10 位数字冲突
+ISBN10_WITH_PREFIX = re.compile(
+    r'ISBN(?:[-\s]*10)?[:\s]*-?\s*'
+    r'(\d[\d\-\s]{7,14}[\dXx])',
     re.IGNORECASE
 )
 
-# 兜底:裸 ISBN(无前缀),要求 13 位(更严格,减少误报)
-ISBN13_BARE = re.compile(r'(?<!\d)(97[89](?:[-\s]?\d){10})(?!\d)')
+TEXT_THRESHOLD = 100      # 低于这个字符数,判定为扫描版
+OCR_FRONT_PAGES = 8       # OCR 扫前 8 页
+OCR_BACK_PAGES = 3        # OCR 扫后 3 页(封底)
 
 
 def clean_isbn(raw: str) -> str:
-    """去掉连字符和空格,统一大小写。"""
     return re.sub(r'[-\s]', '', raw).upper()
 
 
 def validate_isbn(isbn: str) -> bool:
-    """校验 ISBN-10 或 ISBN-13 的校验位。"""
     isbn = clean_isbn(isbn)
     if len(isbn) == 10:
         if not re.fullmatch(r'\d{9}[\dX]', isbn):
@@ -51,52 +68,63 @@ def validate_isbn(isbn: str) -> bool:
 
 
 def find_isbns(text: str) -> list[str]:
-    """从文本中提取所有合法 ISBN,按出现顺序去重。"""
+    """按 ISBN-13 优先的策略提取,避免把 13 位的前 10 位误当成 ISBN-10。"""
     found = []
     seen = set()
 
-    for match in ISBN_PATTERN.finditer(text):
-        isbn = clean_isbn(match.group(1))
-        if validate_isbn(isbn) and isbn not in seen:
-            found.append(isbn)
-            seen.add(isbn)
+    def add(candidate: str) -> bool:
+        if validate_isbn(candidate) and candidate not in seen:
+            found.append(candidate)
+            seen.add(candidate)
+            return True
+        return False
 
-    for match in ISBN13_BARE.finditer(text):
-        isbn = clean_isbn(match.group(1))
-        if validate_isbn(isbn) and isbn not in seen:
-            found.append(isbn)
-            seen.add(isbn)
+    # 1. 先抓 ISBN-13(带前缀或裸号)
+    isbn13_matches = []
+    for m in ISBN13_WITH_PREFIX.finditer(text):
+        isbn13_matches.append((m.start(), m.end(), m.group(1)))
+    for m in ISBN13_BARE.finditer(text):
+        isbn13_matches.append((m.start(), m.end(), m.group(1)))
+
+    # 阻塞区间:所有 ISBN-13 **候选位置**(无论校验是否通过),
+    # 避免该区域内的数字串被 ISBN-10 规则误抓
+    blocked_spans = [(s, e) for s, e, _ in isbn13_matches]
+
+    for _, _, raw in isbn13_matches:
+        digits = clean_isbn(raw)
+        if len(digits) >= 13:
+            add(digits[:13])
+
+    # 2. 再抓 ISBN-10(仅限带 ISBN 前缀的,避免和 13 位串冲突)
+    for m in ISBN10_WITH_PREFIX.finditer(text):
+        # 跳过与 ISBN-13 区间重叠的
+        if any(s <= m.start() < e or s < m.end() <= e for s, e in blocked_spans):
+            continue
+        digits = clean_isbn(m.group(1))
+        if len(digits) >= 10:
+            add(digits[:10])
 
     return found
 
 
-def extract_pdf_text(path: Path, max_pages: int) -> str:
-    """提取 PDF 前 max_pages 页和后 3 页的文本(版权页可能在开头或结尾)。"""
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        raise RuntimeError("缺少 pypdf,请运行: pip install pypdf")
+# -------------------- PDF 文本提取 --------------------
 
-    try:
-        reader = PdfReader(str(path))
-        total = len(reader.pages)
-        # 取前 N 页 + 后 3 页(有些书 ISBN 在封底)
-        indices = list(range(min(max_pages, total)))
-        indices += [i for i in range(max(0, total - 3), total) if i not in indices]
-
-        parts = []
-        for i in indices:
-            try:
-                parts.append(reader.pages[i].extract_text() or '')
-            except Exception:
-                continue
-        return '\n'.join(parts)
-    except Exception as e:
-        return f'__ERROR__: {e}'
+def extract_pdf_text(path: Path, max_pages: int) -> tuple[str, int]:
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    total = len(reader.pages)
+    indices = list(range(min(max_pages, total)))
+    indices += [i for i in range(max(0, total - 3), total) if i not in indices]
+    parts = []
+    for i in indices:
+        try:
+            parts.append(reader.pages[i].extract_text() or '')
+        except Exception:
+            continue
+    return '\n'.join(parts), total
 
 
 def extract_pdf_metadata(path: Path) -> str:
-    """把 PDF 元数据拼成字符串,方便正则扫描。"""
     try:
         from pypdf import PdfReader
         reader = PdfReader(str(path))
@@ -106,105 +134,272 @@ def extract_pdf_metadata(path: Path) -> str:
         return ''
 
 
-def extract_epub_text(path: Path) -> str:
-    """EPUB 本质是 zip,直接读里面的 opf 和前几个 xhtml 文件。"""
+# -------------------- PDF OCR --------------------
+
+_ocr_checked = False
+_ocr_available = False
+_ocr_error = ''
+_ocr_langs: list[str] = []
+
+
+def check_ocr_available() -> tuple[bool, str]:
+    """检查 OCR 依赖,只跑一次,结果缓存。"""
+    global _ocr_checked, _ocr_available, _ocr_error, _ocr_langs
+    if _ocr_checked:
+        return _ocr_available, _ocr_error
+    _ocr_checked = True
+
     try:
-        with zipfile.ZipFile(path) as z:
-            names = z.namelist()
-            # 优先读 opf(元数据)和前几个内容文件
-            targets = [n for n in names if n.lower().endswith('.opf')]
-            content_files = sorted(
-                n for n in names
-                if n.lower().endswith(('.xhtml', '.html', '.htm'))
-            )
-            targets += content_files[:5]  # 前 5 个内容文件
+        import pdf2image  # noqa: F401
+        import pytesseract
+    except ImportError as e:
+        _ocr_error = f'缺少 Python 包: {e.name}。请 pip install pdf2image pytesseract pillow'
+        return False, _ocr_error
 
-            parts = []
-            for name in targets:
-                try:
-                    with z.open(name) as f:
-                        data = f.read().decode('utf-8', errors='ignore')
-                        parts.append(data)
-                except Exception:
-                    continue
-            return '\n'.join(parts)
+    try:
+        pytesseract.get_tesseract_version()
     except Exception as e:
-        return f'__ERROR__: {e}'
+        _ocr_error = f'找不到 tesseract 命令: {e}'
+        return False, _ocr_error
+
+    try:
+        _ocr_langs = list(pytesseract.get_languages())
+        if 'eng' not in _ocr_langs:
+            _ocr_error = f'tesseract 缺少 eng 语言包,已有: {_ocr_langs}'
+            return False, _ocr_error
+        cjk_langs = [l for l in ('chi_sim', 'chi_tra', 'jpn', 'jpn_vert') if l in _ocr_langs]
+        if not cjk_langs:
+            _ocr_error = (f'tesseract 缺少中日文语言包(需要 chi_sim/chi_tra/jpn 任一),'
+                          f'已有: {_ocr_langs}')
+            return False, _ocr_error
+    except Exception as e:
+        _ocr_error = f'无法查询 tesseract 语言: {e}'
+        return False, _ocr_error
+
+    _ocr_available = True
+    return True, ''
 
 
-def process_file(path: Path, max_pages: int) -> tuple[list[str], str]:
-    """返回 (isbn 列表, 错误信息)。"""
-    suffix = path.suffix.lower()
-    text = ''
+def ocr_pdf_pages(path: Path, total_pages: int) -> str:
+    """只 OCR 前 OCR_FRONT_PAGES + 后 OCR_BACK_PAGES 页。"""
+    from pdf2image import convert_from_path
+    import pytesseract
 
-    if suffix == '.pdf':
-        text = extract_pdf_metadata(path) + '\n' + extract_pdf_text(path, max_pages)
-    elif suffix == '.epub':
-        text = extract_epub_text(path)
+    front_end = min(OCR_FRONT_PAGES, total_pages)
+    front = list(range(1, front_end + 1))
+    back_start = max(front_end + 1, total_pages - OCR_BACK_PAGES + 1)
+    back = list(range(back_start, total_pages + 1)) if total_pages > OCR_FRONT_PAGES else []
+
+    lang_parts = [l for l in ('chi_sim', 'chi_tra', 'jpn', 'jpn_vert', 'eng')
+                  if l in _ocr_langs]
+    lang = '+'.join(lang_parts) if lang_parts else 'eng'
+
+    texts = []
+    for page_num in front + back:
+        try:
+            images = convert_from_path(
+                str(path), dpi=300,
+                first_page=page_num, last_page=page_num
+            )
+            for img in images:
+                texts.append(pytesseract.image_to_string(img, lang=lang))
+        except Exception as e:
+            texts.append(f'[OCR page {page_num} failed: {e}]')
+    return '\n'.join(texts)
+
+
+# -------------------- EPUB --------------------
+
+def extract_epub_text(path: Path) -> str:
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        targets = [n for n in names if n.lower().endswith('.opf')]
+        content_files = sorted(
+            n for n in names
+            if n.lower().endswith(('.xhtml', '.html', '.htm'))
+        )
+        targets += content_files[:5]
+        parts = []
+        for name in targets:
+            try:
+                with z.open(name) as f:
+                    parts.append(f.read().decode('utf-8', errors='ignore'))
+            except Exception:
+                continue
+        return '\n'.join(parts)
+
+
+# -------------------- 主处理 --------------------
+
+def process_pdf(path: Path, max_pages: int, ocr_mode: str) -> tuple[list[str], str, str]:
+    """ocr_mode: 'auto' | 'off' | 'force'。返回 (isbns, error, source)。"""
+    try:
+        text, total_pages = extract_pdf_text(path, max_pages)
+    except Exception as e:
+        return [], f'PDF 读取失败: {e}', ''
+
+    metadata = extract_pdf_metadata(path)
+    text_isbns = find_isbns(metadata + '\n' + text)
+
+    need_ocr = False
+    if ocr_mode == 'force':
+        need_ocr = True
+    elif ocr_mode == 'auto':
+        if len(text.strip()) < TEXT_THRESHOLD or not text_isbns:
+            need_ocr = True
+
+    if not need_ocr:
+        return text_isbns, '', 'text' if text_isbns else ''
+
+    ok, err = check_ocr_available()
+    if not ok:
+        return text_isbns, f'OCR 不可用: {err}', 'text' if text_isbns else ''
+
+    try:
+        ocr_text = ocr_pdf_pages(path, total_pages)
+    except Exception as e:
+        return text_isbns, f'OCR 执行失败: {e}', 'text' if text_isbns else ''
+
+    ocr_isbns = find_isbns(ocr_text)
+
+    all_isbns = list(text_isbns)
+    seen = set(all_isbns)
+    for isbn in ocr_isbns:
+        if isbn not in seen:
+            all_isbns.append(isbn)
+            seen.add(isbn)
+
+    if text_isbns and ocr_isbns:
+        source = 'both'
+    elif ocr_isbns:
+        source = 'ocr'
+    elif text_isbns:
+        source = 'text'
     else:
-        return [], 'unsupported'
+        source = ''
+    return all_isbns, '', source
 
-    if text.startswith('__ERROR__'):
-        return [], text.replace('__ERROR__: ', '')
 
-    return find_isbns(text), ''
+def process_file(path: Path, max_pages: int, ocr_mode: str) -> dict:
+    suffix = path.suffix.lower()
+    if suffix == '.pdf':
+        isbns, err, source = process_pdf(path, max_pages, ocr_mode)
+    elif suffix == '.epub':
+        try:
+            text = extract_epub_text(path)
+            isbns = find_isbns(text)
+            err = ''
+            source = 'text' if isbns else ''
+        except Exception as e:
+            isbns, err, source = [], f'EPUB 读取失败: {e}', ''
+    else:
+        return {'isbns': [], 'error': 'unsupported', 'source': ''}
+    return {'isbns': isbns, 'error': err, 'source': source}
 
 
 def main():
-    parser = argparse.ArgumentParser(description='从 PDF / EPUB 批量提取 ISBN')
+    parser = argparse.ArgumentParser(description='从 PDF / EPUB 批量提取 ISBN(支持 OCR)')
     parser.add_argument('directory', help='要扫描的目录')
+    parser.add_argument('-t', '--txt', default='isbns.txt',
+                        help='去重后的 ISBN 列表输出路径(默认 isbns.txt)')
+    parser.add_argument('-f', '--failed', default='failed.txt',
+                        help='识别失败的文件清单输出路径(默认 failed.txt)')
     parser.add_argument('-o', '--output', help='输出 CSV 文件路径(可选)')
     parser.add_argument('-p', '--pages', type=int, default=10,
-                        help='PDF 每本扫描的前 N 页(默认 10)')
-    parser.add_argument('-r', '--recursive', action='store_true', default=True,
-                        help='递归扫描子目录(默认开启)')
+                        help='PDF 文本层扫描的前 N 页(默认 10)')
+    parser.add_argument('--no-ocr', action='store_true', help='禁用 OCR')
+    parser.add_argument('--force-ocr', action='store_true',
+                        help='所有 PDF 强制 OCR(更准但慢)')
     args = parser.parse_args()
+
+    if args.no_ocr and args.force_ocr:
+        print('错误: --no-ocr 和 --force-ocr 不能同时使用', file=sys.stderr)
+        sys.exit(1)
+
+    ocr_mode = 'off' if args.no_ocr else ('force' if args.force_ocr else 'auto')
 
     root = Path(args.directory).expanduser().resolve()
     if not root.is_dir():
         print(f'错误: {root} 不是目录', file=sys.stderr)
         sys.exit(1)
 
-    pattern = '**/*' if args.recursive else '*'
     files = [
-        p for p in root.glob(pattern)
+        p for p in root.glob('**/*')
         if p.is_file() and p.suffix.lower() in ('.pdf', '.epub')
     ]
-
     if not files:
         print('没找到 PDF 或 EPUB 文件')
         return
 
-    print(f'找到 {len(files)} 个文件,开始处理...\n')
+    if ocr_mode != 'off':
+        ok, err = check_ocr_available()
+        if ok:
+            print(f'✓ OCR 环境就绪,语言: {_ocr_langs}')
+        else:
+            print(f'⚠️  OCR 不可用,将只用文本层提取: {err}')
+
+    print(f'找到 {len(files)} 个文件,OCR 模式: {ocr_mode}\n')
 
     results = []
     for i, path in enumerate(files, 1):
         rel = path.relative_to(root)
         print(f'[{i}/{len(files)}] {rel}')
-        isbns, err = process_file(path, args.pages)
-        if err:
-            print(f'    ⚠️  {err}')
-        if isbns:
-            print(f'    ✓ {", ".join(isbns)}')
+        r = process_file(path, args.pages, ocr_mode)
+        tag = f'({r["source"]})' if r['source'] else ''
+        if r['error']:
+            print(f'    ⚠️  {r["error"]}')
+        if r['isbns']:
+            print(f'    ✓ {tag} {", ".join(r["isbns"])}')
         else:
             print('    ✗ 未找到 ISBN')
         results.append({
             'file': str(rel),
-            'isbns': ';'.join(isbns),
-            'error': err,
+            'isbns': ';'.join(r['isbns']),
+            'source': r['source'],
+            'error': r['error'],
         })
 
-    # 汇总
     hit = sum(1 for r in results if r['isbns'])
-    print(f'\n完成: {hit}/{len(results)} 个文件提取到 ISBN')
+    ocr_hit = sum(1 for r in results if r['source'] in ('ocr', 'both'))
+    print(f'\n完成: {hit}/{len(results)} 个文件提取到 ISBN(其中 {ocr_hit} 个借助了 OCR)')
+
+    unique_isbns = []
+    seen = set()
+    for r in results:
+        if not r['isbns']:
+            continue
+        for isbn in r['isbns'].split(';'):
+            if isbn and isbn not in seen:
+                unique_isbns.append(isbn)
+                seen.add(isbn)
+
+    txt_out = Path(args.txt)
+    txt_out.write_text('\n'.join(unique_isbns) + '\n', encoding='utf-8')
+    print(f'去重后共 {len(unique_isbns)} 个 ISBN,已写入: {txt_out}')
+
+    # 失败清单:没提取到 ISBN 的文件(含出错的)
+    failed_records = [r for r in results if not r['isbns']]
+    failed_out = Path(args.failed)
+    if failed_records:
+        lines = []
+        for r in failed_records:
+            reason = r['error'] or '未找到 ISBN'
+            lines.append(f'{r["file"]}\t{reason}')
+        failed_out.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        print(f'失败清单 {len(failed_records)} 个文件,已写入: {failed_out}')
+    else:
+        # 没有失败就清掉可能存在的旧文件,避免误导
+        if failed_out.exists():
+            failed_out.unlink()
+        print('没有失败文件 🎉')
 
     if args.output:
         out = Path(args.output)
         with out.open('w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['file', 'isbns', 'error'])
+            writer = csv.DictWriter(f, fieldnames=['file', 'isbns', 'source', 'error'])
             writer.writeheader()
             writer.writerows(results)
-        print(f'结果已写入: {out}')
+        print(f'文件映射已写入: {out}')
 
 
 if __name__ == '__main__':
