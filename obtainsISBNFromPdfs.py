@@ -4,20 +4,12 @@
 支持文字版 PDF 和扫描版 PDF(自动 OCR 回退)。
 
 用法:
-    python extract_isbn.py <目录路径> [-t isbns.txt] [-o mapping.csv]
-    python extract_isbn.py <目录路径> --no-ocr          # 禁用 OCR
-    python extract_isbn.py <目录路径> --force-ocr       # 强制所有 PDF 都 OCR
+    python obtainsISBNFromPdfs.py <目录路径> [-t isbns.txt] [-o mapping.csv]
+    python obtainsISBNFromPdfs.py <目录路径> --no-ocr          # 禁用 OCR
+    python obtainsISBNFromPdfs.py <目录路径> --force-ocr       # 强制所有 PDF 都 OCR
 
 Python 依赖:
     pip install pypdf pdf2image pytesseract pillow
-
-系统依赖(OCR 需要):
-    # macOS(tesseract-lang 一次装齐所有语言):
-    brew install tesseract tesseract-lang poppler
-    # Ubuntu/Debian:
-    sudo apt install tesseract-ocr poppler-utils \\
-        tesseract-ocr-chi-sim tesseract-ocr-chi-tra \\
-        tesseract-ocr-jpn tesseract-ocr-jpn-vert
 """
 
 import argparse
