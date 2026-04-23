@@ -28,19 +28,40 @@ import zipfile
 from pathlib import Path
 
 
-# ISBN-13:13 位数字,中间允许连字符/空格,可选 ISBN 前缀,必须 978/979 开头
+# 只提取 ISBN-13
+# 关键设计:
+# 1. 正则精确匹配 13 位数字(不贪婪扩展),避免 "97871116412470000" 误识别
+# 2. 前后用 lookaround 断言:
+#    - 前置:不紧邻数字(避免前缀污染)
+#    - 后置:不紧邻 "dash + 数字"(避免 dash 延续性污染);但允许 "空白 + 数字"(ISBN + 附加码场景)
+# 3. 分隔符字符类区分两类:
+#    - 空白(_WS):空格/tab/换行/全角空格,代表"分开了"
+#    - 连字符/破折号(_DASH):ASCII - 和各种 Unicode dash,代表"延续"
+# 4. 三个原子正则:有 ISBN 前缀的 / 裸号的 / 条码格式(1-6-6 分组)的
+
+_WS = r'[\s\u3000]'                                        # 空白类:分隔
+_DASH = r'[-\u2010-\u2015\u2212\uFE63\uFF0D]'              # 连字符/破折号类:延续
+_SEP = r'(?:' + _WS + r'|' + _DASH + r')'                  # 综合分隔符
+
+_ISBN13_CORE = r'97[89](?:' + _SEP + r'*\d){10}'
+
+# 后置 lookaround:只禁止 dash+数字(延续),允许空白+数字(两个独立编号)
+_NOT_CONTINUED = r'(?!' + _DASH + r'*\d)'
+
 ISBN13_WITH_PREFIX = re.compile(
-    r'ISBN(?:[-\s]*13)?[:\s]*-?\s*'
-    r'(97[89][\d\-\s]{9,16}\d)',       # 978/979 + 10~17 字符(含分隔符) + 末尾数字
+    r'ISBN(?:' + _SEP + r'*13)?[:\s]*' + _SEP + r'*'
+    r'(' + _ISBN13_CORE + r')' + _NOT_CONTINUED,
     re.IGNORECASE
 )
-ISBN13_BARE = re.compile(r'(?<![\d])(97[89][\d\-\s]{9,16}\d)(?![\d])')
+ISBN13_BARE = re.compile(
+    r'(?<![\d])(' + _ISBN13_CORE + r')' + _NOT_CONTINUED
+)
 
-# ISBN-10:必须有 ISBN 前缀,避免跟其他 10 位数字冲突
-ISBN10_WITH_PREFIX = re.compile(
-    r'ISBN(?:[-\s]*10)?[:\s]*-?\s*'
-    r'(\d[\d\-\s]{7,14}[\dXx])',
-    re.IGNORECASE
+# 条码格式(EAN-13):"9 787111 641247" 1-6-6 分组,空白分隔(不是 dash)
+ISBN13_BARCODE = re.compile(
+    r'(?<![\d])'
+    r'(9' + _WS + r'+7[89]\d{4}' + _WS + r'+\d{6})'
+    r'(?![\d])'
 )
 
 TEXT_THRESHOLD = 100      # 低于这个字符数,判定为扫描版
@@ -49,60 +70,40 @@ OCR_BACK_PAGES = 3        # OCR 扫后 3 页(封底)
 
 
 def clean_isbn(raw: str) -> str:
-    return re.sub(r'[-\s]', '', raw).upper()
+    """去掉所有分隔符(ASCII 和 Unicode 破折号/空格),统一大写。"""
+    return re.sub(_SEP, '', raw).upper()
 
 
 def validate_isbn(isbn: str) -> bool:
+    """只验证 ISBN-13。"""
     isbn = clean_isbn(isbn)
-    if len(isbn) == 10:
-        if not re.fullmatch(r'\d{9}[\dX]', isbn):
-            return False
-        total = sum((10 - i) * (10 if c == 'X' else int(c)) for i, c in enumerate(isbn))
-        return total % 11 == 0
-    if len(isbn) == 13:
-        if not isbn.isdigit():
-            return False
-        total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(isbn))
-        return total % 10 == 0
-    return False
+    if len(isbn) != 13 or not isbn.isdigit():
+        return False
+    if not (isbn.startswith('978') or isbn.startswith('979')):
+        return False
+    total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(isbn))
+    return total % 10 == 0
 
 
 def find_isbns(text: str) -> list[str]:
-    """按 ISBN-13 优先的策略提取,避免把 13 位的前 10 位误当成 ISBN-10。"""
+    """只提取合法的 ISBN-13,按首次出现顺序去重。"""
     found = []
     seen = set()
 
-    def add(candidate: str) -> bool:
-        if validate_isbn(candidate) and candidate not in seen:
-            found.append(candidate)
-            seen.add(candidate)
-            return True
-        return False
-
-    # 1. 先抓 ISBN-13(带前缀或裸号)
-    isbn13_matches = []
-    for m in ISBN13_WITH_PREFIX.finditer(text):
-        isbn13_matches.append((m.start(), m.end(), m.group(1)))
-    for m in ISBN13_BARE.finditer(text):
-        isbn13_matches.append((m.start(), m.end(), m.group(1)))
-
-    # 阻塞区间:所有 ISBN-13 **候选位置**(无论校验是否通过),
-    # 避免该区域内的数字串被 ISBN-10 规则误抓
-    blocked_spans = [(s, e) for s, e, _ in isbn13_matches]
-
-    for _, _, raw in isbn13_matches:
+    def try_add(raw: str):
         digits = clean_isbn(raw)
         if len(digits) >= 13:
-            add(digits[:13])
+            candidate = digits[:13]
+            if validate_isbn(candidate) and candidate not in seen:
+                found.append(candidate)
+                seen.add(candidate)
 
-    # 2. 再抓 ISBN-10(仅限带 ISBN 前缀的,避免和 13 位串冲突)
-    for m in ISBN10_WITH_PREFIX.finditer(text):
-        # 跳过与 ISBN-13 区间重叠的
-        if any(s <= m.start() < e or s < m.end() <= e for s, e in blocked_spans):
-            continue
-        digits = clean_isbn(m.group(1))
-        if len(digits) >= 10:
-            add(digits[:10])
+    for m in ISBN13_WITH_PREFIX.finditer(text):
+        try_add(m.group(1))
+    for m in ISBN13_BARE.finditer(text):
+        try_add(m.group(1))
+    for m in ISBN13_BARCODE.finditer(text):
+        try_add(m.group(1))
 
     return found
 
@@ -234,23 +235,99 @@ def ocr_pdf_pages(path: Path, total_pages: int) -> str:
 
 # -------------------- EPUB --------------------
 
+# HTML 标签去除(简单版,够用)
+_HTML_TAG = re.compile(r'<[^>]+>')
+# XML 命名空间
+_DC_NS = '{http://purl.org/dc/elements/1.1/}'
+_OPF_NS = '{http://www.idpf.org/2007/opf}'
+
+
+def _parse_opf_identifiers(opf_content: str) -> list[str]:
+    """从 OPF XML 里结构化提取 dc:identifier 的文本内容。
+
+    EPUB 规范里 ISBN 的标准表达方式:
+    - EPUB 3: <dc:identifier>urn:isbn:9787111641247</dc:identifier>
+    - EPUB 2: <dc:identifier opf:scheme="ISBN">9787111641247</dc:identifier>
+
+    返回所有 identifier 的文本(交给 find_isbns 再做校验提取)。
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(opf_content)
+    except ET.ParseError:
+        return []
+
+    texts = []
+    # 所有 dc:identifier
+    for elem in root.iter(_DC_NS + 'identifier'):
+        if elem.text:
+            texts.append(elem.text)
+    # 3.0 里 ISBN 也可能在 <meta property="...">
+    for elem in root.iter():
+        if elem.tag.endswith('}meta') or elem.tag == 'meta':
+            prop = (elem.get('property') or elem.get('name') or '').lower()
+            if 'isbn' in prop and elem.text:
+                texts.append(elem.text)
+    return texts
+
+
+def _strip_html(content: str) -> str:
+    """粗略去掉 HTML 标签,保留文本内容。
+
+    避免 '978-7-111</span>-<span>64124-7' 这种被标签切开的情况导致 ISBN 漏提。
+    """
+    return _HTML_TAG.sub(' ', content)
+
+
 def extract_epub_text(path: Path) -> str:
-    with zipfile.ZipFile(path) as z:
-        names = z.namelist()
-        targets = [n for n in names if n.lower().endswith('.opf')]
-        content_files = sorted(
-            n for n in names
-            if n.lower().endswith(('.xhtml', '.html', '.htm'))
-        )
-        targets += content_files[:5]
-        parts = []
-        for name in targets:
-            try:
-                with z.open(name) as f:
-                    parts.append(f.read().decode('utf-8', errors='ignore'))
-            except Exception:
-                continue
-        return '\n'.join(parts)
+    """读 EPUB 里可能含 ISBN 的文本。
+
+    策略(OPF 优先):
+    1. 先结构化解析所有 .opf 文件的 identifier / meta 字段
+    2. 如果已经能从 OPF 里提到合法 ISBN → 直接返回 OPF 文本,不读正文
+       这样避免正文引用其他书的 ISBN 污染结果
+    3. OPF 找不到 → 兜底读所有 .xhtml/.html,剥离 HTML 标签后返回
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            opf_files = [n for n in names if n.lower().endswith('.opf')]
+            content_files = sorted(
+                n for n in names
+                if n.lower().endswith(('.xhtml', '.html', '.htm'))
+            )
+
+            # 1. 先读 OPF
+            opf_parts = []
+            opf_identifier_texts = []   # 从结构化字段里提取的值
+            for name in opf_files:
+                try:
+                    with z.open(name) as f:
+                        content = f.read().decode('utf-8', errors='ignore')
+                    opf_identifier_texts.extend(_parse_opf_identifiers(content))
+                    opf_parts.append(content)
+                except Exception:
+                    continue
+
+            # 2. 判断 OPF 里是否已经找到合法 ISBN
+            # 先用 identifier 字段文本尝试提取;不行再扫整个 OPF(兜底非标准字段)
+            probe_text = '\n'.join(opf_identifier_texts) + '\n' + '\n'.join(opf_parts)
+            if find_isbns(probe_text):
+                # OPF 足够了,直接返回,不读正文
+                return probe_text
+
+            # 3. OPF 无 ISBN,兜底读所有内容文件
+            parts = list(opf_parts)  # 保留 OPF 文本(也许有非规范位置的 ISBN)
+            for name in content_files:
+                try:
+                    with z.open(name) as f:
+                        content = f.read().decode('utf-8', errors='ignore')
+                    parts.append(_strip_html(content))
+                except Exception:
+                    continue
+            return '\n'.join(parts)
+    except zipfile.BadZipFile:
+        return ''
 
 
 # -------------------- 主处理 --------------------
