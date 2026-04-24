@@ -529,7 +529,7 @@ def main():
         workers = args.jobs
     else:
         cpu = os.cpu_count() or 4
-        workers = max(2, cpu // 2)
+        workers = 7
     # 文件数少时不用上那么多进程
     workers = min(workers, len(files))
 
